@@ -1,6 +1,6 @@
 """Tests for GBMSimulator."""
 
-from app.market.seed_prices import SEED_PRICES
+from app.market.seed_prices import SEED_PRICES, seed_price_for
 from app.market.simulator import GBMSimulator
 
 
@@ -126,6 +126,27 @@ class TestGBMSimulator:
         result = sim.step()
         price_str = str(result["AAPL"])
         # Check that we have at most 2 decimal places
-        if '.' in price_str:
-            decimal_part = price_str.split('.')[1]
+        if "." in price_str:
+            decimal_part = price_str.split(".")[1]
             assert len(decimal_part) <= 2
+
+    def test_unknown_ticker_seed_price_is_deterministic(self):
+        """Same symbol -> same starting price across instances/restarts."""
+        a = GBMSimulator(tickers=["ZZZZ"]).get_price("ZZZZ")
+        b = GBMSimulator(tickers=["ZZZZ"]).get_price("ZZZZ")
+        assert a == b == seed_price_for("ZZZZ")
+        assert seed_price_for("ZZZZ") != seed_price_for("YYYY")
+
+    def test_initial_prices_override_seeds(self):
+        sim = GBMSimulator(tickers=["AAPL", "PYPL"], initial_prices={"PYPL": 112.0, "AAPL": 0})
+        assert sim.get_price("PYPL") == 112.0
+        assert sim.get_price("AAPL") == SEED_PRICES["AAPL"]  # non-positive hint ignored
+
+    def test_add_ticker_with_initial_price(self):
+        sim = GBMSimulator(tickers=["AAPL"])
+        sim.add_ticker("PYPL", initial_price=80.0)
+        assert sim.get_price("PYPL") == 80.0
+
+    def test_sub_dollar_prices_keep_precision(self):
+        sim = GBMSimulator(tickers=["PENNY"], initial_prices={"PENNY": 0.0123}, event_probability=0)
+        assert 0.01 < sim.step()["PENNY"] < 0.02

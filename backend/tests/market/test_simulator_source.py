@@ -5,10 +5,9 @@ import asyncio
 import pytest
 
 from app.market.cache import PriceCache
-from app.market.simulator import SimulatorDataSource
+from app.market.simulator import GBMSimulator, SimulatorDataSource
 
 
-@pytest.mark.asyncio
 class TestSimulatorDataSource:
     """Integration tests for the SimulatorDataSource."""
 
@@ -128,11 +127,76 @@ class TestSimulatorDataSource:
         """Test creating source with custom event probability."""
         cache = PriceCache()
         # Very high event probability for testing
-        source = SimulatorDataSource(
-            price_cache=cache, update_interval=0.1, event_probability=1.0
-        )
+        source = SimulatorDataSource(price_cache=cache, update_interval=0.1, event_probability=1.0)
         await source.start(["AAPL"])
 
         # Just verify it starts and stops cleanly
         await asyncio.sleep(0.2)
         await source.stop()
+
+    async def test_add_before_start_is_remembered(self):
+        cache = PriceCache()
+        source = SimulatorDataSource(price_cache=cache, update_interval=0.1)
+        await source.add_ticker("tsla")
+        assert source.get_tickers() == ["TSLA"]
+        await source.start(["AAPL"])
+        assert set(source.get_tickers()) == {"AAPL", "TSLA"}
+        assert cache.get("TSLA") is not None
+        await source.stop()
+
+    async def test_lowercase_add_does_not_duplicate(self):
+        """Regression: add_ticker('aapl') used to create a second 'aapl' ticker."""
+        cache = PriceCache()
+        source = SimulatorDataSource(price_cache=cache, update_interval=0.1)
+        await source.start(["AAPL"])
+        v = cache.version
+        await source.add_ticker("aapl")
+        assert source.get_tickers() == ["AAPL"]
+        assert "aapl" not in cache
+        assert cache.version == v  # no-op add does not reset the price
+        await source.stop()
+
+    async def test_start_twice_raises(self):
+        source = SimulatorDataSource(price_cache=PriceCache(), update_interval=0.1)
+        await source.start(["AAPL"])
+        with pytest.raises(RuntimeError):
+            await source.start(["AAPL"])
+        await source.stop()
+
+    async def test_initial_prices_used_on_start_and_add(self):
+        cache = PriceCache()
+        source = SimulatorDataSource(price_cache=cache, update_interval=10)
+        source.set_initial_prices({"aapl": 150.0, "pypl": 112.0, "BAD TICKER": 1.0, "MSFT": 0})
+        await source.start(["AAPL", "MSFT"])
+        await source.add_ticker("PYPL")
+        assert cache.get_price("AAPL") == 150.0
+        assert cache.get_price("PYPL") == 112.0
+        assert cache.get_price("MSFT") == 420.0  # zero hint ignored -> seed
+        await source.stop()
+
+    async def test_dt_derived_from_update_interval(self):
+        source = SimulatorDataSource(price_cache=PriceCache(), update_interval=2.0)
+        await source.start(["AAPL"])
+        assert source._sim._dt == pytest.approx(2.0 / GBMSimulator.TRADING_SECONDS_PER_YEAR)
+        await source.stop()
+
+    async def test_seeded_rng_is_reproducible(self):
+        import numpy as np
+
+        async def run():
+            cache = PriceCache()
+            src = SimulatorDataSource(cache, update_interval=10, rng=np.random.default_rng(7))
+            await src.start(["AAPL", "MSFT"])
+            prices = [src._sim.step() for _ in range(5)]
+            await src.stop()
+            return prices
+
+        assert await run() == await run()
+
+    async def test_first_price_is_reference_price(self):
+        cache = PriceCache()
+        source = SimulatorDataSource(price_cache=cache, update_interval=0.01)
+        await source.start(["AAPL"])
+        await asyncio.sleep(0.05)
+        await source.stop()
+        assert cache.get("AAPL").reference_price == 190.0

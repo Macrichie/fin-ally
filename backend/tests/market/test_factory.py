@@ -1,6 +1,7 @@
 """Tests for market data source factory."""
 
 import os
+from pathlib import Path
 from unittest.mock import patch
 
 from app.market.cache import PriceCache
@@ -77,3 +78,49 @@ class TestFactory:
 
         assert isinstance(source, MassiveDataSource)
         assert source._cache is cache
+
+    def test_poll_interval_default(self):
+        with patch.dict(os.environ, {"MASSIVE_API_KEY": "k"}, clear=True):
+            source = create_market_data_source(PriceCache())
+        assert source._interval == 15.0
+
+    def test_poll_interval_from_env(self):
+        with patch.dict(
+            os.environ, {"MASSIVE_API_KEY": "k", "MASSIVE_POLL_INTERVAL": "3"}, clear=True
+        ):
+            source = create_market_data_source(PriceCache())
+        assert source._interval == 3.0
+
+    def test_poll_interval_invalid_falls_back(self):
+        with patch.dict(
+            os.environ, {"MASSIVE_API_KEY": "k", "MASSIVE_POLL_INTERVAL": "fast"}, clear=True
+        ):
+            source = create_market_data_source(PriceCache())
+        assert source._interval == 15.0
+
+    def test_poll_interval_clamped(self):
+        with patch.dict(
+            os.environ, {"MASSIVE_API_KEY": "k", "MASSIVE_POLL_INTERVAL": "0"}, clear=True
+        ):
+            source = create_market_data_source(PriceCache())
+        assert source._interval == 1.0
+
+    def test_simulator_mode_does_not_import_massive(self):
+        """The `massive` package is only loaded when MASSIVE_API_KEY is set."""
+        import subprocess
+        import sys
+
+        code = (
+            "import os, sys; os.environ.pop('MASSIVE_API_KEY', None);"
+            "from app.market import PriceCache, create_market_data_source;"
+            "create_market_data_source(PriceCache());"
+            "print('massive' in sys.modules)"
+        )
+        out = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            check=True,
+            cwd=Path(__file__).resolve().parents[2],
+        )
+        assert out.stdout.strip() == "False"

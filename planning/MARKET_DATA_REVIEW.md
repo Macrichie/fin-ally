@@ -5,6 +5,8 @@
 **Reviewed against:** `planning/PLAN.md` §6/§10, `planning/MARKET_DATA_DESIGN.md` (current contract, incl. §15 change list), `planning/MARKET_DATA_SUMMARY.md`, `planning/archive/*`
 **Previous review:** `planning/archive/MARKET_DATA_REVIEW.md` (2026-02-10)
 
+> **Resolution (2026-11-26):** all items in §7 (1–9) and the minor points in §3.10 have been implemented on branch `market-data-fixes`. 185 tests pass, ruff is clean, and coverage is 99%. See `MARKET_DATA_SUMMARY.md` for the fix list.
+
 ---
 
 ## 1. Verdict

@@ -1,5 +1,9 @@
 """Tests for PriceCache."""
 
+import threading
+
+import pytest
+
 from app.market.cache import PriceCache
 
 
@@ -101,3 +105,74 @@ class TestPriceCache:
         cache = PriceCache()
         update = cache.update("AAPL", 190.12345)
         assert update.price == 190.12
+
+
+class TestPriceCacheRound2:
+    """Fixes from the round-2 review (§3.3, §3.6)."""
+
+    def test_reference_price_defaults_to_first_price_and_persists(self):
+        c = PriceCache()
+        c.update("AAPL", 190.0)
+        c.update("AAPL", 191.0)
+        u = c.update("AAPL", 192.0)
+        assert u.reference_price == 190.0
+        assert u.day_change_percent == pytest.approx(1.0526, abs=1e-3)
+
+    def test_explicit_reference_price_overrides(self):
+        c = PriceCache()
+        c.update("AAPL", 190.0)
+        u = c.update("AAPL", 191.2, reference_price=189.87)
+        assert u.reference_price == 189.87
+        assert u.day_change == pytest.approx(1.33)
+
+    def test_reference_price_kept_when_omitted_after_explicit(self):
+        c = PriceCache()
+        c.update("AAPL", 191.2, reference_price=189.87)
+        assert c.update("AAPL", 191.5).reference_price == 189.87
+
+    def test_remove_bumps_version(self):
+        c = PriceCache()
+        c.update("AAPL", 190.0)
+        v = c.version
+        c.remove("AAPL")
+        assert c.version == v + 1
+
+    def test_remove_missing_does_not_bump_version(self):
+        c = PriceCache()
+        v = c.version
+        c.remove("NOPE")
+        assert c.version == v
+
+    def test_timestamp_zero_is_respected(self):
+        assert PriceCache().update("X", 1.0, timestamp=0.0).timestamp == 0.0
+
+    def test_sub_dollar_prices_keep_precision(self):
+        c = PriceCache()
+        u = c.update("PENNY", 0.012345)
+        assert u.price == 0.0123
+        assert u.reference_price == 0.0123
+
+    def test_concurrent_writers_and_readers(self):
+        c = PriceCache()
+        tickers = [f"T{i}" for i in range(20)]
+        n_iter = 500
+
+        def writer(offset):
+            for i in range(n_iter):
+                for t in tickers:
+                    c.update(t, 100.0 + offset + i * 0.01)
+
+        def reader():
+            for _ in range(n_iter):
+                snap = c.get_all()
+                assert all(u.price > 0 for u in snap.values())
+
+        threads = [threading.Thread(target=writer, args=(k,)) for k in range(4)]
+        threads += [threading.Thread(target=reader) for _ in range(4)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join()
+
+        assert len(c) == len(tickers)
+        assert c.version == 4 * n_iter * len(tickers)

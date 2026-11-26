@@ -1236,7 +1236,7 @@ uv run --extra dev pytest --cov=app --cov-report=term-missing
 uv run --extra dev ruff check app/ tests/
 ```
 
-Current state: **73 tests, all passing.** Coverage is about 84%; `stream.py` is about 31% and `massive_client.py` about 56%. The additions below close the gaps found in §15.
+Current state: **185 tests, all passing, 99% coverage.** Every addition below has been implemented (see `MARKET_DATA_SUMMARY.md`).
 
 ### 14.1 Interface conformance (new: `tests/market/test_conformance.py`)
 
@@ -1458,6 +1458,8 @@ With `MASSIVE_API_KEY` unset (simulator), Playwright checks that within 2 s of l
 ---
 
 ## 15. Change List (Gaps in Current Code)
+
+> ✅ Items 1–8 were implemented on 2026-11-26. Item 9 (app integration) is the next phase.
 
 Prioritized. Each item points at the section that has the target code.
 
