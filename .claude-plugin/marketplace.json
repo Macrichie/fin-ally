@@ -1,0 +1,21 @@
+{
+	"name": "Digitalab-tools",
+	"owner": {
+		"name": "DA",
+		"email": "makanjuolakunle@gmail.com"
+	},
+	"plugins": [
+		{
+			"name": "independent-reviewer",
+			"source": "./independent-reviewer",
+			"description": "carry out independent review of all changes since last commit",
+			"version": "1.0.0",
+			"author": {
+				"name": "DA"
+			}
+
+
+
+		}
+	]
+}

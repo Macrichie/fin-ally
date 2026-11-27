@@ -88,7 +88,6 @@ The user runs a single Docker command (or a provided start script). A browser op
 finally/
 ├── frontend/                 # Next.js TypeScript project (static export)
 ├── backend/                  # FastAPI uv project (Python)
-│   └── db/                   # Schema definitions, seed data, migration logic
 ├── planning/                 # Project-wide documentation for agents
 │   ├── PLAN.md               # This document
 │   └── ...                   # Additional agent reference docs
@@ -109,8 +108,7 @@ finally/
 ### Key Boundaries
 
 - **`frontend/`** is a self-contained Next.js project. It knows nothing about Python. It talks to the backend via `/api/*` endpoints and `/api/stream/*` SSE endpoints. Internal structure is up to the Frontend Engineer agent.
-- **`backend/`** is a self-contained uv project with its own `pyproject.toml`. It owns all server logic including database initialization, schema, seed data, API routes, SSE streaming, market data, and LLM integration. Internal structure is up to the Backend/Market Data agents.
-- **`backend/db/`** contains schema SQL definitions and seed logic. The backend lazily initializes the database on first request — creating tables and seeding default data if the SQLite file doesn't exist or is empty.
+- **`backend/`** is a self-contained uv project with its own `pyproject.toml`. It owns all server logic including database initialization, schema (defined inline in Python, e.g. `app/database.py`), seed data, API routes, SSE streaming, market data, and LLM integration. Internal structure is up to the Backend/Market Data agents. The backend lazily initializes the database on first startup — creating tables and seeding default data if the SQLite file doesn't exist or is empty.
 - **`db/`** at the top level is the runtime volume mount point. The SQLite file (`db/finally.db`) is created here by the backend and persists across container restarts via Docker volume.
 - **`planning/`** contains project-wide documentation, including this plan. All agents reference files here as the shared contract.
 - **`test/`** contains Playwright E2E tests and supporting infrastructure (e.g., `docker-compose.test.yml`). Unit tests live within `frontend/` and `backend/` respectively, following each framework's conventions.
@@ -201,17 +199,16 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 - `created_at` TEXT (ISO timestamp)
 
 **watchlist** — Tickers the user is watching
-- `id` TEXT PRIMARY KEY (UUID)
 - `user_id` TEXT (default: `"default"`)
 - `ticker` TEXT
 - `added_at` TEXT (ISO timestamp)
-- UNIQUE constraint on `(user_id, ticker)`
+- PRIMARY KEY `(user_id, ticker)`
 
-**positions** — Current holdings (one row per ticker per user)
+**positions** — Current holdings (one row per ticker per user). Row is **deleted** when quantity reaches 0 (fully sold).
 - `id` TEXT PRIMARY KEY (UUID)
 - `user_id` TEXT (default: `"default"`)
 - `ticker` TEXT
-- `quantity` REAL (fractional shares supported)
+- `quantity` INTEGER (whole shares only — simplifies validation, avoids float rounding)
 - `avg_cost` REAL
 - `updated_at` TEXT (ISO timestamp)
 - UNIQUE constraint on `(user_id, ticker)`
@@ -221,7 +218,7 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 - `user_id` TEXT (default: `"default"`)
 - `ticker` TEXT
 - `side` TEXT (`"buy"` or `"sell"`)
-- `quantity` REAL (fractional shares supported)
+- `quantity` INTEGER (whole shares only)
 - `price` REAL
 - `executed_at` TEXT (ISO timestamp)
 
@@ -257,15 +254,16 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/portfolio` | Current positions, cash balance, total value, unrealized P&L |
-| POST | `/api/portfolio/trade` | Execute a trade: `{ticker, quantity, side}` |
-| GET | `/api/portfolio/history` | Portfolio value snapshots over time (for P&L chart) |
+| POST | `/api/portfolio/trade` | Execute a trade: `{ticker, quantity, side}` → returns trade confirmation + updated cash & position |
+| GET | `/api/portfolio/history?limit=N` | Portfolio value snapshots (default limit: 500, most recent first) |
+| GET | `/api/portfolio/trades?limit=N` | Trade history log (default limit: 50, most recent first) |
 
 ### Watchlist
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/watchlist` | Current watchlist tickers with latest prices |
-| POST | `/api/watchlist` | Add a ticker: `{ticker}` |
-| DELETE | `/api/watchlist/{ticker}` | Remove a ticker |
+| POST | `/api/watchlist` | Add a ticker: `{ticker}` — also calls `source.add_ticker()` to start price generation |
+| DELETE | `/api/watchlist/{ticker}` | Remove a ticker — also calls `source.remove_ticker()` to stop price generation |
 
 ### Chat
 | Method | Path | Description |
@@ -276,6 +274,32 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/health` | Health check (for Docker/deployment) |
+
+### Standard Error Response
+
+All endpoints return errors in a consistent shape with appropriate HTTP status codes:
+
+```json
+{"error": "Insufficient cash", "detail": {"required": 5000.0, "available": 2300.0}}
+```
+
+- `400` — Validation errors (negative quantity, insufficient cash/shares, invalid side)
+- `404` — Unknown ticker (not in watchlist / not tracked)
+- `409` — Duplicate (e.g., adding a ticker already on the watchlist)
+
+### Trade Response Shape
+
+`POST /api/portfolio/trade` returns the executed trade plus updated state:
+
+```json
+{
+  "trade": {"id": "...", "ticker": "AAPL", "side": "buy", "quantity": 10, "price": 191.25, "executed_at": "..."},
+  "cash_balance": 8087.50,
+  "position": {"ticker": "AAPL", "quantity": 10, "avg_cost": 191.25, "current_price": 191.30, "unrealized_pnl": 0.50}
+}
+```
+
+This lets the frontend update in one round-trip without a separate portfolio refetch.
 
 ---
 
@@ -290,7 +314,7 @@ There is an OPENROUTER_API_KEY in the .env file in the project root.
 When the user sends a chat message, the backend:
 
 1. Loads the user's current portfolio context (cash, positions with P&L, watchlist with live prices, total portfolio value)
-2. Loads recent conversation history from the `chat_messages` table
+2. Loads the **last 20 messages** from the `chat_messages` table (older messages are kept in DB for display but not sent to the LLM)
 3. Constructs a prompt with a system message, portfolio context, conversation history, and the user's new message
 4. Calls the LLM via LiteLLM → OpenRouter, requesting structured output, using the cerebras-inference skill
 5. Parses the complete structured JSON response
@@ -325,7 +349,21 @@ Trades specified by the LLM execute automatically — no confirmation dialog. Th
 - It creates an impressive, fluid demo experience
 - It demonstrates agentic AI capabilities — the core theme of the course
 
-If a trade fails validation (e.g., insufficient cash), the error is included in the chat response so the LLM can inform the user.
+If a trade fails validation (e.g., insufficient cash), the error is included in the chat response so the user sees what happened. The API response to the frontend includes an `executed_actions` field showing success/failure per trade:
+
+```json
+{
+  "message": "I bought 10 shares of AAPL for you.",
+  "executed_actions": {
+    "trades": [
+      {"ticker": "AAPL", "side": "buy", "quantity": 10, "status": "success", "price": 191.25}
+    ],
+    "watchlist_changes": [
+      {"ticker": "PYPL", "action": "add", "status": "success"}
+    ]
+  }
+}
+```
 
 ### System Prompt Guidance
 
@@ -352,9 +390,9 @@ When `LLM_MOCK=true`, the backend returns deterministic mock responses instead o
 
 The frontend is a single-page application with a dense, terminal-inspired layout. The specific component architecture and layout system is up to the Frontend Engineer, but the UI should include these elements:
 
-- **Watchlist panel** — grid/table of watched tickers with: ticker symbol, current price (flashing green/red on change), daily change %, and a sparkline mini-chart (accumulated from SSE since page load)
+- **Watchlist panel** — grid/table of watched tickers with: ticker symbol, current price (flashing green/red on change), change % (from previous SSE update, using `change_percent` from the price event), and a sparkline mini-chart (accumulated from SSE since page load)
 - **Main chart area** — larger chart for the currently selected ticker, with at minimum price over time. Clicking a ticker in the watchlist selects it here.
-- **Portfolio heatmap** — treemap visualization where each rectangle is a position, sized by portfolio weight, colored by P&L (green = profit, red = loss)
+- **Portfolio heatmap** — treemap visualization where each rectangle is a position, sized by portfolio weight, colored by P&L (green = profit, red = loss). Shows a placeholder message when the user has no positions.
 - **P&L chart** — line chart showing total portfolio value over time, using data from `portfolio_snapshots`
 - **Positions table** — tabular view of all positions: ticker, quantity, avg cost, current price, unrealized P&L, % change
 - **Trade bar** — simple input area: ticker field, quantity field, buy button, sell button. Market orders, instant fill.
@@ -366,8 +404,10 @@ The frontend is a single-page application with a dense, terminal-inspired layout
 - Use `EventSource` for SSE connection to `/api/stream/prices`
 - Canvas-based charting library preferred (Lightweight Charts or Recharts) for performance
 - Price flash effect: on receiving a new price, briefly apply a CSS class with background color transition, then remove it
-- All API calls go to the same origin (`/api/*`) — no CORS configuration needed
+- All API calls go to the same origin (`/api/*`) — no CORS configuration needed in production
+- **Dev proxy**: during development, Next.js runs on port 3000. Configure `next.config.js` `rewrites` to proxy `/api/*` to `http://localhost:8000` so the frontend dev server can reach the backend without CORS.
 - Tailwind CSS for styling with a custom dark theme
+- **Portfolio refresh**: after any trade (manual or via chat), refetch `/api/portfolio` to get updated state. The trade response includes the updated position and cash balance for immediate UI feedback; a full refetch ensures consistency.
 
 ---
 
@@ -454,3 +494,53 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 - Portfolio visualization: heatmap renders with correct colors, P&L chart has data points
 - AI chat (mocked): send a message, receive a response, trade execution appears inline
 - SSE resilience: disconnect and verify reconnection
+
+---
+
+## 13. Resolved Decisions & Implementation Notes
+
+*Review items from 2026-11-20 and 2026-11-23 have been resolved and incorporated into the plan above. This section records the decisions and remaining notes for reference.*
+
+### Decisions Made (incorporated into plan)
+
+| Item | Decision | Where Updated |
+|------|----------|---------------|
+| `backend/db/` directory | Dropped. Schema defined inline in Python (`app/database.py`). | Section 4 |
+| Fractional shares | Dropped. `quantity` is INTEGER (whole shares only). | Section 7 |
+| "Daily change %" | Renamed to "Change %". Uses `change_percent` from SSE `PriceUpdate`. | Section 10 |
+| Portfolio history pagination | Added `?limit=N` (default 500). | Section 8 |
+| Chat history cap | Last 20 messages sent to LLM; older kept in DB for display. | Section 9 |
+| Fully sold positions | Row deleted when quantity reaches 0. | Section 7 |
+| Watchlist primary key | Composite `(user_id, ticker)` — UUID `id` column dropped. | Section 7 |
+| API error format | Standard `{"error", "detail"}` shape with HTTP status codes. | Section 8 |
+| Trade response shape | Returns trade + updated cash + position in one response. | Section 8 |
+| Chat executed actions | Response includes `executed_actions` with per-trade success/failure. | Section 9 |
+| Watchlist ↔ market data sync | POST/DELETE watchlist calls `source.add_ticker()`/`remove_ticker()`. | Section 8 |
+| Trade history endpoint | Added `GET /api/portfolio/trades?limit=N`. | Section 8 |
+| Heatmap empty state | Shows placeholder when no positions exist. | Section 10 |
+| Dev proxy | Next.js `rewrites` proxies `/api/*` to backend during development. | Section 10 |
+| Portfolio refresh after trades | Refetch `/api/portfolio` after trade; trade response provides immediate data. | Section 10 |
+
+### Implementation Notes
+
+- **Database**: Use stdlib `sqlite3` (synchronous). No `aiosqlite` needed — SQLite on local file is sub-millisecond for single-user queries. FastAPI handles this fine.
+- **Pydantic models**: Use for all API request/response shapes. Free validation, OpenAPI docs, and type safety with FastAPI.
+- **Backend dependencies still needed in `pyproject.toml`**: `litellm` (LLM calls), `python-dotenv` (`.env` loading), `pydantic` (already a FastAPI transitive dep, but pin it explicitly).
+- **`.env.example`**: Create when the main app is wired up, containing the three env vars from Section 5.
+- **Seed prices**: Hardcoded and will drift from reality. Acceptable for a demo — the simulator doesn't claim real prices.
+- **LLM model fallback**: If `openrouter/openai/gpt-oss-120b` is unavailable, the backend should return a clear error to the chat UI rather than silently failing. A fallback model can be added later if needed.
+
+### Codebase Status
+
+- **Market data**: Complete and tested (73 tests passing). Interface, simulator, Massive client, cache, SSE streaming, factory all implemented.
+- **Still to build**: FastAPI main app, database layer, portfolio/watchlist/trade routes, LLM chat integration, frontend (no code yet), Dockerfile, docker-compose, scripts, .env.example.
+
+### Recommended Build Order
+
+1. **Database layer** — schema, initialization, seed data (unblocks everything else)
+2. **FastAPI main app + portfolio/watchlist/trade routes** — core CRUD, wired to DB
+3. **Frontend scaffold** — Next.js project, layout shell, SSE connection, watchlist display
+4. **Trade execution** — trade bar + portfolio display, end-to-end flow working
+5. **LLM chat integration** — backend chat route + frontend chat panel
+6. **Docker + scripts** — Dockerfile, compose, start/stop scripts
+7. **Polish** — sparklines, heatmap, animations, edge cases, E2E tests
